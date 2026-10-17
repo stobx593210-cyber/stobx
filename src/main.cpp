@@ -1,0 +1,71 @@
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <cstdlib>
+
+#include "Lexer.h"
+#include "Parser.h"
+#include "CodeGen.h"
+
+int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        std::cerr << "Usage: ./stobx <filename.stobx>\n";
+        return 1;
+    }
+
+    std::ifstream file(argv[1]);
+
+    if (!file.is_open()) {
+        std::cerr << "Error: Could not open file " << argv[1] << "\n";
+        return 1;
+    }
+
+    std::stringstream buffer;
+    buffer << file.rdbuf();
+
+    std::string sourceCode = buffer.str();
+
+    try {
+        Lexer lexer(sourceCode);
+        auto tokens = lexer.tokenize();
+
+        Parser parser(tokens);
+        auto ast = parser.parse();
+
+        if (!parser.getErrors().empty()) {
+            for (const auto& error : parser.getErrors()) {
+                std::cerr << error << "\n";
+            }
+
+            return 1;
+        }
+
+        CodeGen codegen;
+        codegen.generate(ast.get());
+        codegen.printIR();
+
+        int compileResult = std::system(
+            "clang output.ll -o stobx_program"
+        );
+
+        if (compileResult != 0) {
+            std::cerr << "Error: Failed to compile STOBX program\n";
+            return 1;
+        }
+
+        int runResult = std::system(
+            "./stobx_program"
+        );
+
+        if (runResult != 0) {
+            std::cerr << "Error: Failed to run STOBX program\n";
+            return 1;
+        }
+
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << "\n";
+        return 1;
+    }
+
+    return 0;
+}
