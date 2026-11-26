@@ -1,87 +1,188 @@
-
-#include <iostream>
-#include <fstream>
-#include <sstream>
-#include <cstdlib>
-#include <cstdio>
-
-#include "SP.h"
+#include "CodeGen.h"
+#include "CorrectionEngine.h"
+#include "DiagnosticUI.h"
 #include "Lexer.h"
 #include "Parser.h"
-#include "CodeGen.h"
-#include "DiagnosticUI.h"
-#include "CorrectionEngine.h"
+#include "SP.h"
 
-int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        std::cerr << "Usage: ./stobx <filename.stobx>\n";
-        return 1;
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iostream>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+
+using namespace stobx;
+
+namespace {
+
+constexpr std::uintmax_t kMaxSourceBytes = 64ULL * 1024ULL * 1024ULL;
+
+struct CliOptions {
+    std::string inputPath;
+    bool skipCorrectionPrompt = false;
+    bool runAfterBuild = false;
+};
+
+bool parseCliArgs(int argc, char* argv[], CliOptions& opts) {
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--no-fix") {
+            opts.skipCorrectionPrompt = true;
+        } else if (arg == "--run") {
+            opts.runAfterBuild = true;
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "Error: Unknown option: " << arg << "\n";
+            return false;
+        } else if (opts.inputPath.empty()) {
+            opts.inputPath = arg;
+        } else {
+            std::cerr << "Error: Unexpected argument: " << arg << "\n";
+            return false;
+        }
     }
 
-const char* skipFile = ".stobx_skip_correction";
-bool skipCorrectionPrompt = false;
+    if (opts.inputPath.empty()) {
+        std::cerr << "Usage: ./stobx [--no-fix] [--run] <filename.stobx>\n";
+        return false;
+    }
 
-std::ifstream skipFlag(skipFile);
-
-if (skipFlag.good()) {
-    skipCorrectionPrompt = true;
-    skipFlag.close();
-    std::remove(skipFile);
+    return true;
 }
 
-    SP processor;
-
-    if (!processor.process(argv[1])) {
-        if (!processor.process(argv[1])) {
-            return 1;
+std::string shellEscape(const std::string& raw) {
+#ifdef _WIN32
+    std::string escaped = "\"";
+    for (char ch : raw) {
+        if (ch == '"') {
+            escaped += "\\\"";
+        } else {
+            escaped += ch;
         }
+    }
+    escaped += "\"";
+    return escaped;
+#else
+    std::string escaped = "'";
+    for (char ch : raw) {
+        if (ch == '\'') {
+            escaped += "'\\''";
+        } else {
+            escaped += ch;
+        }
+    }
+    escaped += "'";
+    return escaped;
+#endif
+}
 
-        return 0;
+std::string readFileContents(const std::string& path) {
+    std::error_code szErr;
+    const auto fileSize = std::filesystem::file_size(path, szErr);
+    if (!szErr && fileSize > kMaxSourceBytes) {
+        throw std::runtime_error("Source file exceeds maximum supported size: " + path);
     }
 
-    std::ifstream file(argv[1]);
-
+    std::ifstream file(path, std::ios::in | std::ios::binary);
     if (!file.is_open()) {
-        std::cerr << "Error: Could not open file " << argv[1] << "\n";
+        throw std::runtime_error("Could not open file: " + path);
+    }
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    return buffer.str();
+}
+
+void writeFileContents(const std::string& path, const std::string& content) {
+    std::ofstream out(path, std::ios::out | std::ios::trunc | std::ios::binary);
+    if (!out.is_open()) {
+        throw std::runtime_error("Could not write file: " + path);
+    }
+    out << content;
+}
+
+std::size_t clampDiagnosticOffset(
+    std::size_t baseOffset,
+    std::ptrdiff_t offsetAdjustment,
+    std::size_t currentSize
+) noexcept {
+    const std::ptrdiff_t rawOffset =
+        static_cast<std::ptrdiff_t>(baseOffset) + offsetAdjustment;
+    if (rawOffset <= 0) {
+        return 0u;
+    }
+    return std::min<std::size_t>(
+        static_cast<std::size_t>(rawOffset),
+        currentSize
+    );
+}
+
+void printParserErrors(const Parser& parser) {
+    for (const auto& error : parser.getErrors()) {
+        std::cerr << error << "\n";
+    }
+}
+
+} // namespace
+
+int main(int argc, char* argv[]) {
+    CliOptions opts;
+    if (!parseCliArgs(argc, argv, opts)) {
         return 1;
     }
 
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-
-    std::string sourceCode = buffer.str();
+    SP processor;
+    if (!processor.process(opts.inputPath.c_str())) {
+        std::cerr << "Error: Pre-processing failed for " << opts.inputPath << "\n";
+        return 1;
+    }
 
     try {
+        std::string sourceCode = readFileContents(opts.inputPath);
+
+
         Lexer lexer(sourceCode);
         auto tokens = lexer.tokenize();
 
-        Parser parser(tokens);
+        Parser parser(tokens, sourceCode);
         auto ast = parser.parse();
 
-        if (!parser.getDiagnostics().empty() && !skipCorrectionPrompt){
+        if (!parser.getErrors().empty()) {
+            printParserErrors(parser);
+        }
+
+        bool anyFileModified = false;
+
+        if (!parser.getDiagnostics().empty() && !opts.skipCorrectionPrompt) {
             DiagnosticUI ui;
-            
             CorrectionEngine correctionEngine;
 
             std::string currentSourceCode = sourceCode;
-            std::size_t offsetAdjustment = 0;
+            std::ptrdiff_t offsetAdjustment = 0;
 
             for (const auto& diagnostic : parser.getDiagnostics()) {
                 ui.showDiagnostic(diagnostic);
 
-                std::string correction =
+                const std::string correction =
                     correctionEngine.suggestCorrection(diagnostic.id);
-
                 ui.showCorrection(correction);
 
                 Diagnostic adjustedDiagnostic = diagnostic;
-                adjustedDiagnostic.offset += offsetAdjustment;
+                adjustedDiagnostic.offset = clampDiagnosticOffset(
+                    diagnostic.offset,
+                    offsetAdjustment,
+                    currentSourceCode.size()
+                );
 
-                std::string preview =
-                    correctionEngine.createPreview(
-                        currentSourceCode,
-                        adjustedDiagnostic
-                    );
+                const std::string preview = correctionEngine.createPreview(
+                    currentSourceCode,
+                    adjustedDiagnostic
+                );
 
                 if (preview.empty()) {
                     std::cout << "Could not create correction preview.\n";
@@ -89,76 +190,126 @@ if (skipFlag.good()) {
                 }
 
                 if (ui.askForCorrection()) {
-                    std::ofstream outputFile(
-                        argv[1],
-                        std::ios::out | std::ios::trunc
-                    );
-
-                    if (!outputFile.is_open()) {
-                        std::cerr << "Error: Could not save corrected file.\n";
-                        return 1;
-                    }
-
-                    outputFile << preview;
-                    outputFile.close();
-
+                    writeFileContents(opts.inputPath, preview);
                     offsetAdjustment +=
-                        preview.size() - currentSourceCode.size();
-
+                        static_cast<std::ptrdiff_t>(preview.size()) -
+                        static_cast<std::ptrdiff_t>(currentSourceCode.size());
                     currentSourceCode = preview;
-
-               } else {
-    std::cout << "\nCorrection cancelled.\n";
-
-    std::ofstream skipFlag(skipFile);
-
-    if (!skipFlag.is_open()) {
-        std::cerr << "Error: Could not save temporary state.\n";
-        return 1;
-    }
-
-    skipFlag.close();
-
-    return 1;
-}
-
+                    anyFileModified = true;
+                } else {
+                    std::cout << "\nCorrection cancelled.";
+                    if (anyFileModified) {
+                        std::cout << " (Earlier accepted changes were already saved to file.)";
+                    }
+                    std::cout << "\n";
+                    return 1;
+                }
             }
 
-                        return 1;
+            if (anyFileModified) {
+                sourceCode = currentSourceCode;
+                Lexer updatedLexer(sourceCode);
+                tokens = updatedLexer.tokenize();
+                Parser updatedParser(tokens, sourceCode);
+
+                ast = updatedParser.parse();
+                parser = std::move(updatedParser);
+            }
         }
 
         if (!parser.getErrors().empty()) {
-
-
-            for (const auto& error : parser.getErrors()) {
-                std::cerr << error << "\n";
+            if (anyFileModified) {
+                printParserErrors(parser);
             }
-
             return 1;
+        }
+
+        const std::filesystem::path inputFsPath(opts.inputPath);
+        const std::filesystem::path stemName = inputFsPath.stem();
+        if (stemName.empty()) {
+            throw std::runtime_error("Invalid input file stem name for: " + opts.inputPath);
+        }
+
+        const std::filesystem::path outputDir =
+            inputFsPath.parent_path().empty()
+                ? std::filesystem::path(".")
+                : inputFsPath.parent_path();
+        const std::filesystem::path targetLlPath =
+            outputDir / (stemName.string() + ".ll");
+        const std::filesystem::path exePath = outputDir / stemName;
+
+        std::error_code fsErr;
+        if (std::filesystem::exists(exePath, fsErr) &&
+            std::filesystem::is_directory(exePath, fsErr)) {
+            throw std::runtime_error(
+                "Output executable path collides with an existing directory: " +
+                exePath.string()
+            );
+        }
+
+        if (std::filesystem::exists(inputFsPath, fsErr) &&
+            std::filesystem::exists(exePath, fsErr) &&
+            std::filesystem::equivalent(inputFsPath, exePath, fsErr)) {
+            throw std::runtime_error(
+                "Refusing to overwrite source file with compiled binary: " +
+                exePath.string()
+            );
+        }
+
+        const std::filesystem::path defaultLlPath("output.ll");
+        if (std::filesystem::exists(defaultLlPath, fsErr) && defaultLlPath != targetLlPath) {
+            std::filesystem::remove(defaultLlPath, fsErr);
+            std::filesystem::remove(targetLlPath, fsErr);
         }
 
         CodeGen codegen;
         codegen.generate(ast.get());
         codegen.printIR();
 
-        int compileResult = std::system(
-            "clang output.ll -o stobx_program"
-        );
+        if (std::filesystem::exists(defaultLlPath, fsErr) && defaultLlPath != targetLlPath) {
+            std::filesystem::rename(defaultLlPath, targetLlPath, fsErr);
+            if (fsErr) {
+                throw std::runtime_error(
+                    "Failed to move generated IR to: " + targetLlPath.string()
+                );
+            }
+        }
 
+        if (!std::filesystem::exists(targetLlPath, fsErr)) {
+            throw std::runtime_error(
+                "Generated LLVM IR file not found: " + targetLlPath.string()
+            );
+        }
+
+        const std::string compileCmd =
+            "clang " + shellEscape(targetLlPath.string()) +
+            " -o " + shellEscape(exePath.string());
+        const int compileResult = std::system(compileCmd.c_str());
+        if (compileResult < 0) {
+            throw std::runtime_error(
+                "Failed to invoke shell/compiler for: " + targetLlPath.string()
+            );
+        }
         if (compileResult != 0) {
-            std::cerr << "Error: Failed to compile STOBX program\n";
-            return 1;
+            throw std::runtime_error(
+                "clang failed while compiling: " + targetLlPath.string()
+            );
         }
 
-        int runResult = std::system(
-            "./stobx_program"
-        );
-
-        if (runResult != 0) {
-            std::cerr << "Error: Failed to run STOBX program\n";
-            return 1;
+        if (opts.runAfterBuild) {
+            const std::string runCmd = shellEscape(exePath.string());
+            const int runResult = std::system(runCmd.c_str());
+            if (runResult < 0) {
+                throw std::runtime_error(
+                    "Failed to invoke shell to run executable: " + exePath.string()
+                );
+            }
+            if (runResult != 0) {
+                throw std::runtime_error(
+                    "Compiled program exited with non-zero status: " + exePath.string()
+                );
+            }
         }
-
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << "\n";
         return 1;
@@ -166,4 +317,3 @@ if (skipFlag.good()) {
 
     return 0;
 }
-
